@@ -1,0 +1,11 @@
+README.md
+pyproject.toml
+src/papertrail.egg-info/PKG-INFO
+src/papertrail.egg-info/SOURCES.txt
+src/papertrail.egg-info/dependency_links.txt
+src/papertrail.egg-info/requires.txt
+src/papertrail.egg-info/top_level.txt
+src/papertrail/api/main.py
+src/papertrail/api/schemas/document.py
+src/papertrail/db/models.py
+src/papertrail/ingestion/parser.py

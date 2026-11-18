@@ -1,0 +1,367 @@
+Metadata-Version: 2.4
+Name: papertrail
+Version: 0.1.0
+Summary: Add your description here
+Requires-Python: >=3.12
+Description-Content-Type: text/markdown
+Requires-Dist: fastapi>=0.162.2
+Requires-Dist: openai>=3.46.0
+Requires-Dist: pydantic>=2.14.3
+Requires-Dist: pymupdf>=2.1
+Requires-Dist: sqlalchemy>=2.1.8
+
+# PaperTrail
+
+**A multi-tenant, citation-grounded Q&A service over research papers, built as a production-style RAG system and driven by evaluation.**
+
+PaperTrail lets each tenant upload research-paper PDFs and ask questions about them. Every answer comes with page-level citations, and the system declines to answer when the retrieved evidence is too weak. Each design choice (chunking, hybrid retrieval, reranking, routing) is justified by a measured before/after result on a golden evaluation set.
+
+> **Status:** In active development. Sections marked *(planned)* describe the target design. Results tables are filled in only with numbers I have measured myself.
+
+---
+
+## Table of Contents
+- [Why this project](#why-this-project)
+- [What it does](#what-it-does)
+- [Architecture](#architecture)
+- [Tech stack](#tech-stack)
+- [Dataset](#dataset)
+- [Evaluation](#evaluation)
+- [Project structure](#project-structure)
+- [Getting started](#getting-started)
+- [Configuration](#configuration)
+- [API](#api)
+- [Roadmap](#roadmap)
+- [Design decisions](#design-decisions)
+- [Failure modes](#failure-modes)
+- [Results](#results)
+- [Limitations](#limitations)
+- [Future work](#future-work)
+- [References](#references)
+- [License](#license)
+
+---
+
+## Why this project
+
+Most RAG demos stop at "embed chunks, retrieve top-k, ask an LLM." Production systems fail in less obvious places: messy PDF layouts, chunks contaminated by neighboring content, concurrent ingestion corrupting a shared index, rate limits, silent retrieval regressions, and answers with no grounding.
+
+PaperTrail is built to address those problems directly:
+
+- **Evaluation first.** A golden set and a baseline exist before any optimization.
+- **Layout-aware ingestion.** Papers are parsed by structure (sections, tables, captions), not split blindly by character count.
+- **Hybrid retrieval.** Dense and sparse search are fused and reranked, with each stage ablated.
+- **Grounded answers.** Citations are enforced in the output schema, and the system abstains on weak evidence.
+- **Service-grade engineering.** Tenant isolation, tracing, timeouts, retries, tests and CI.
+
+## What it does
+
+- Ingests PDFs per tenant through an idempotent, asynchronous pipeline.
+- Parses documents with structure awareness and attaches metadata to every chunk (paper, section, page, element type).
+- Answers natural-language questions with citations that point to a paper and page.
+- Routes questions: content questions go to hybrid retrieval, and metadata questions (year, author, venue) go to a text-to-SQL path.
+- Abstains with an explanation when evidence is insufficient.
+- Isolates tenants so one tenant's documents are never retrievable by another.
+- Streams responses and records traces (latency, token usage, cost) for every query.
+
+## Architecture
+
+```
+                         ┌────────────────────────────────────────────┐
+  PDFs ──► Docling parse ──► structure-aware chunking                  │
+                         │        │                                   │
+                         │        ▼                                   │
+                         │  embed (dense + sparse)                    │
+                         │        │                                   │
+                         │        ▼                                   │
+                         │  Qdrant (tenant-filtered)   Postgres       │
+                         │                             (papers, jobs) │
+                         └────────────────────────────────────────────┘
+
+  Query ──► auth / tenant ──► router (LangGraph)
+                                 │
+              ┌──────────────────┼───────────────────┐
+              ▼                  ▼                   ▼
+        vector path        metadata path         abstain
+   rewrite → hybrid →     text-to-SQL over      (insufficient
+   RRF → rerank           papers table           evidence)
+              └──────────────────┬───────────────────┘
+                                 ▼
+                    synthesizer (citations enforced)
+                                 ▼
+                           SSE stream response
+
+  Cross-cutting: Langfuse tracing · structured logging · retries/timeouts · eval harness in CI
+```
+
+### Components
+
+| Component | Responsibility |
+|---|---|
+| **Ingestion** | Parse PDFs, chunk by structure, embed, upsert idempotently via content hashing, track job state |
+| **Retrieval** | Dense + sparse search, Reciprocal Rank Fusion, cross-encoder reranking, tenant filtering |
+| **Agent layer** | Small LangGraph workflow: router, vector path, metadata (SQL) path, synthesizer |
+| **LLM wrapper** | Single module for all LLM calls: timeouts, capped retries with backoff, token and cost accounting |
+| **Evaluation** | Golden-set loader, retrieval and answer metrics, ablation runner, CI regression gate |
+| **Observability** | Traces, structured logs, per-query latency and cost |
+
+## Tech stack
+
+| Area | Tools |
+|---|---|
+| Language and API | Python, FastAPI, Pydantic v2 |
+| Document parsing | Docling (PyMuPDF as fallback) |
+| Vector store | Qdrant (dense + sparse vectors, payload filters for tenancy) |
+| Embeddings and reranking | BGE-family embedding model (e.g. bge-m3 / bge-small), BGE cross-encoder reranker |
+| Orchestration | LangGraph (small, deliberate graph) |
+| LLM | A cost-efficient mini-tier model via API (configurable) |
+| Relational storage | PostgreSQL (paper metadata, ingestion jobs) |
+| Evaluation | Custom golden set + metrics; RAGAS / DeepEval as secondary checks |
+| Observability | Langfuse, structured logging |
+| Testing and quality | pytest, Ruff |
+| Packaging and CI | Docker, Docker Compose, GitHub Actions |
+| Deployment | Fly.io / Render / single VM *(planned)* |
+
+## Dataset
+
+**Corpus:** a focused collection of roughly 100–150 open-access research papers from [arXiv](https://arxiv.org/), chosen around one narrow topic (for example, retrieval-augmented generation and LLM evaluation) so that questions are answerable and multi-hop questions are possible.
+
+**Licensing and redistribution:**
+- arXiv metadata is openly available, but each paper carries its own license. Only papers with licenses permitting reuse are used.
+- PDFs are **not committed** to this repository. A script downloads the corpus from a list of arXiv IDs (`data/corpus_manifest.csv`).
+
+**Golden evaluation set:** 40–60 hand-written question/answer pairs, each annotated with the source paper and page(s). Question types:
+
+| Type | Purpose |
+|---|---|
+| Factual lookup | Tests basic retrieval and extraction |
+| Multi-hop | Needs evidence from more than one chunk or paper |
+| Table / figure-related | Tests structure-aware parsing |
+| Metadata | Tests the SQL path (year, author, venue) |
+| Unanswerable | Tests abstention and hallucination resistance |
+
+The golden set is small and committed under `data/eval/`.
+
+## Evaluation
+
+Evaluation is the backbone of the project. Every change is measured against the same golden set.
+
+**Retrieval metrics:** Recall@k, MRR, nDCG.
+**Answer metrics:** answer correctness, faithfulness to retrieved context, citation accuracy, abstention accuracy on unanswerable questions.
+**System metrics:** p50/p95 latency, tokens and cost per query, ingestion throughput.
+
+**Planned ablation ladder:**
+
+1. Naive baseline (fixed-size chunks, dense-only, top-k)
+2. + Structure-aware chunking
+3. + Hybrid (dense + sparse) with RRF
+4. + Cross-encoder reranking
+5. + Query rewriting
+6. + Router and abstention
+
+LLM-judged metrics are spot-checked by hand rather than trusted blindly. A reduced version of the evaluation runs in CI as a regression gate.
+
+## Project structure
+
+```
+papertrail/
+├── README.md
+├── pyproject.toml            # dependencies, ruff/pytest config
+├── Makefile                  # make run / test / eval / lint
+├── .env.example              # every env var, no secrets
+├── .gitignore
+├── Dockerfile
+├── docker-compose.yml        # app + qdrant + postgres (+ langfuse)
+├── .github/workflows/ci.yml  # lint, tests, small eval gate
+│
+├── configs/                  # chunk sizes, model names, retrieval params (yaml)
+├── prompts/                  # versioned prompt files, not inline strings
+│
+├── docs/
+│   ├── architecture.md
+│   ├── decisions/            # ADRs, e.g. 001-vector-store.md
+│   ├── failure-modes.md      # symptom → root cause → fix → test
+│   └── results.md            # ablation tables, latency, cost
+│
+├── data/                     # gitignored except eval/
+│   ├── raw/
+│   ├── processed/
+│   ├── corpus_manifest.csv   # arXiv IDs used
+│   └── eval/                 # golden set (committed)
+│
+├── notebooks/                # exploration only; no logic lives here
+├── scripts/                  # CLI entrypoints: ingest_corpus.py, run_eval.py
+│
+├── src/papertrail/
+│   ├── api/                  # main.py, routes/, deps.py, schemas
+│   ├── core/                 # config, logging, errors, auth
+│   ├── ingestion/            # parsing, chunking, pipeline, jobs
+│   ├── retrieval/            # embeddings, vector store client, hybrid, rerank
+│   ├── agents/               # graph, nodes, state
+│   ├── llm/                  # client wrapper: retries, timeouts, token accounting
+│   ├── db/                   # models, repositories, migrations
+│   ├── evaluation/           # metrics, runner, dataset loading
+│   └── observability/        # tracing setup, metrics
+│
+└── tests/
+    ├── unit/
+    ├── integration/          # needs qdrant/postgres via compose
+    └── eval/                 # regression checks on the golden set
+```
+
+### Conventions
+
+- **Thin API layer.** Routes validate input and call services; no business logic in routes.
+- **Dependencies point inward.** `api` may import `retrieval` and `agents`, never the reverse.
+- **One wrapper per external system.** LLM, vector store and database each live in a single module so they can be swapped or mocked.
+- **Config in one place.** Nothing outside `core/config.py` reads environment variables.
+- **Notebooks are disposable.** Anything worth keeping moves into `src/`.
+
+## Getting started
+
+*(planned — commands will be finalized as the project is built)*
+
+**Prerequisites:** Python 3.11+, Docker and Docker Compose, an LLM API key.
+
+```bash
+# 1. Clone
+git clone https://github.com/<your-username>/papertrail.git
+cd papertrail
+
+# 2. Configure
+cp .env.example .env        # fill in API keys and settings
+
+# 3. Start dependencies (Qdrant, Postgres, Langfuse)
+docker compose up -d
+
+# 4. Install
+pip install -e ".[dev]"
+
+# 5. Download the corpus and ingest it
+python scripts/ingest_corpus.py --manifest data/corpus_manifest.csv --tenant demo
+
+# 6. Run the API
+make run
+
+# 7. Run tests and evaluation
+make test
+make eval
+```
+
+## Configuration
+
+All settings are loaded through a single settings module and documented in `.env.example`. Expected groups:
+
+| Group | Examples |
+|---|---|
+| LLM | API key, model name, request timeout, max retries, concurrency limit |
+| Qdrant | URL, collection naming, vector dimensions |
+| Postgres | connection URL |
+| Retrieval | top-k, fusion parameters, reranker model, abstention threshold |
+| Observability | Langfuse keys, log level |
+| Auth | API-key to tenant mapping |
+
+Retrieval and chunking parameters live in `configs/` so experiments are reproducible.
+
+## API
+
+*(planned design)*
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/v1/documents` | Upload a PDF for the authenticated tenant; returns a job ID |
+| `GET` | `/v1/jobs/{job_id}` | Ingestion job status |
+| `POST` | `/v1/query` | Ask a question; streams an answer with citations |
+| `GET` | `/healthz` | Liveness and dependency checks |
+
+Authentication uses a simple API key that maps to a tenant. Every query and ingestion call is scoped to that tenant.
+
+**Example response shape (planned):**
+
+```json
+{
+  "answer": "...",
+  "citations": [
+    { "paper_id": "...", "title": "...", "page": 7, "snippet_id": "..." }
+  ],
+  "abstained": false,
+  "route": "vector"
+}
+```
+
+## Roadmap
+
+| Day | Focus | Deliverable |
+|---|---|---|
+| 1 | Scope, corpus, baseline | Golden set + naive baseline numbers |
+| 2 | Ingestion | Structure-aware parsing and chunking, idempotent jobs, tenant isolation test |
+| 3 | Retrieval | Hybrid + rerank, ablation table |
+| 4 | Agent layer | Router, SQL path, citations, abstention, streaming |
+| 5 | Production hardening | Tracing, retries/timeouts, auth tests, CI eval gate, Docker |
+| 6 | Ship | Deployment, README polish, demo recording |
+
+Progress checklist:
+
+- [ ] Corpus selected and manifest committed
+- [ ] Golden set written
+- [ ] Naive baseline measured
+- [ ] Ingestion pipeline
+- [ ] Hybrid retrieval and reranking
+- [ ] Router, SQL path, abstention
+- [ ] Observability and hardening
+- [ ] CI with eval gate
+- [ ] Deployed demo
+
+## Design decisions
+
+Short architecture decision records live in `docs/decisions/`. Planned records include:
+
+- Why Qdrant (dense + sparse in one store, payload filtering for tenancy)
+- Chunking strategy and chunk-size choice
+- Why hybrid retrieval with RRF instead of score blending
+- Why a small LangGraph workflow instead of a large agent
+- Tenant isolation approach (payload filters vs. separate collections)
+- How abstention thresholds are chosen
+
+## Failure modes
+
+`docs/failure-modes.md` documents real problems encountered while building and the engineering fixes, each as **symptom → root cause → fix → regression test**. The areas it covers include:
+
+- Cross-document contamination from concurrent writes to shared state
+- Parser or vision-model hallucination on sparse or unusual regions
+- Pathological regexes that hang on large documents
+- LLM rate-limit handling (concurrency limits, capped retries, timeouts)
+- Silent retrieval regressions caught by the eval gate
+
+## Results
+
+*To be filled in with measured numbers only.*
+
+| Configuration | Recall@5 | MRR | Answer correctness | Faithfulness | p95 latency | Cost / query |
+|---|---|---|---|---|---|---|
+| Naive baseline | – | – | – | – | – | – |
+| + Structure-aware chunking | – | – | – | – | – | – |
+| + Hybrid (RRF) | – | – | – | – | – | – |
+| + Reranker | – | – | – | – | – | – |
+| + Query rewriting | – | – | – | – | – | – |
+| + Router and abstention | – | – | – | – | – | – |
+
+## Limitations
+
+- The corpus is small and domain-narrow; results may not transfer to other document types.
+- The golden set is hand-written and limited in size, so metric differences between close configurations may be noise.
+- Table and figure understanding is limited to what the parser extracts.
+- Tenant isolation is enforced at the application and vector-store filter level, not at the infrastructure level.
+- Single-node deployment; no horizontal scaling.
+
+## Future work
+
+- Entity graph / GraphRAG for multi-hop questions, compared against the baseline
+- Feedback loop: user ratings feed new golden cases, with case-based memory for similar past queries
+- Multimodal figure and table question answering with a vision-language model
+- Fine-tuned reranker or embedding model using synthetic hard negatives
+- Semantic caching with measured hit rate and cost savings
+- Load testing (Locust) and a latency/cost dashboard
+- Prompt-injection defenses for malicious text inside uploaded PDFs
+- MCP server exposing the service as a tool
+- A/B framework for chunking strategies

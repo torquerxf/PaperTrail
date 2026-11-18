@@ -7,6 +7,14 @@ requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.162.2",
     "openai>=3.46.0",
+    "psycopg[binary]>=3.3.9",
     "pydantic>=2.14.3",
+    "pymupdf>=2.1",
     "sqlalchemy>=2.1.8",
 ]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/papertrail"]
